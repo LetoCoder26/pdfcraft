@@ -1284,12 +1284,14 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, own: O
             continue;
         }
         let r = ObjRef { num, generation: doc.generation(num) };
-        if root_moved && Some(r) == root {
-            // Judged above, against the signed catalog.
-            continue;
-        }
         let new = doc.get(r);
         let before = old.try_get(num).ok().filter(|o| !matches!(**o, Object::Null));
+        if root_moved && Some(r) == root && before.is_none() {
+            // A new catalog object: judged above, against the signed catalog. One that existed
+            // when signed is judged by that role too (signed page content overwritten with a copy
+            // of the catalog must not pass as an unchanged catalog).
+            continue;
+        }
         if before.as_deref() == Some(&*new) {
             // The same content at a new place. That is true for the renderer as well only when
             // the entry locates the object itself: where this reader had to search for the

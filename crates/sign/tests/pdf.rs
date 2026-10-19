@@ -2403,6 +2403,20 @@ fn signing_an_unsigned_field_later_is_a_permitted_signature_change() {
 }
 
 #[test]
+fn a_signed_object_turned_into_the_catalog_is_still_judged() {
+    // The page draws a Form XObject (object 7). A later revision overwrites it with a copy of the
+    // signed catalog and names it from the trailer's /Root. The catalogs compare equal, but object
+    // 7 was signed page content: the page no longer shows its text.
+    let accepted = accepted_levels(&fixture_with_xobject(), |doc| {
+        let catalog = doc.get(doc.root().unwrap()).as_dict().cloned().unwrap();
+        let drawn = pdfcraft_cos::ObjRef { num: 7, generation: 0 };
+        doc.set(drawn, Object::Dict(catalog));
+        doc.trailer_mut().set(b"Root".to_vec(), Object::Ref(drawn));
+    });
+    assert!(accepted.is_empty(), "a signed XObject turned into the catalog was accepted:\n{}", accepted.join("\n"));
+}
+
+#[test]
 fn the_catalogs_perms_do_not_change_under_no_changes() {
     // /Perms names the certification signature (DocMDP). Under P=1 nothing may change, so a later
     // revision that drops it or points it elsewhere breaks the certification, whether it edits
