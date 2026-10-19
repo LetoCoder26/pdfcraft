@@ -2199,3 +2199,224 @@ fn rewritten_page_resources_are_page_content_whatever_keys_they_carry() {
         s.modification
     );
 }
+
+// ── Signature dictionaries, copied signatures and the catalog after signing ──────────────────
+
+/// The DocMDP levels at which `attack` on the signed `base` is *not* refused, each with what the
+/// validator said. Empty when every level refuses it (and the untouched file is valid).
+fn accepted_levels(base: &[u8], attack: impl Fn(&mut Document)) -> Vec<String> {
+    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
+    let trust = TrustStore { certs: vec![id.certificate.clone()] };
+    let check = |bytes: &[u8]| signatures(&open(bytes), bytes, &trust).into_iter().find(|s| s.signed).unwrap();
+    let mut accepted = Vec::new();
+    for certify in LEVELS {
+        let signed = pdfcraft_sign::sign(&open(base), &id, &SignOptions { certify, ..opts() }).unwrap();
+        assert_eq!(check(&signed).status, Status::Valid, "{certify:?}: untouched");
+        let s = check(&edit_after(&signed, &attack));
+        if s.status != Status::Invalid || !matches!(s.modification, Modification::Disallowed(_)) {
+            accepted.push(format!("certify {certify:?}: {:?}, {:?}", s.status, s.modification));
+        }
+    }
+    accepted
+}
+
+/// The signature dictionary (the value of the signed field) in `doc`.
+fn signature_dict(doc: &Document) -> pdfcraft_cos::ObjRef {
+    doc.object_numbers()
+        .into_iter()
+        .map(|num| pdfcraft_cos::ObjRef { num, generation: doc.generation(num) })
+        .find(|r| doc.get(*r).as_dict().is_some_and(|d| d.name(b"Type") == Some(b"Sig") && d.contains(b"ByteRange")))
+        .expect("a signature dictionary")
+}
+
+#[test]
+fn a_signature_dictionary_is_not_rewritten_after_signing() {
+    // A new reason, or a new signing date (the time the certificate's validity is checked at).
+    type Attack = fn(&mut Document);
+    let rewrites: [(&str, Attack); 3] = [
+        ("a new /Reason", |doc| {
+            let r = signature_dict(doc);
+            doc.update_dict(r, |d| d.set(b"Reason".to_vec(), PdfString::text("Forged reason"))).unwrap();
+        }),
+        ("a new /M", |doc| {
+            let r = signature_dict(doc);
+            doc.update_dict(r, |d| d.set(b"M".to_vec(), PdfString::text("D:20990101000000Z"))).unwrap();
+        }),
+        // Lowering the certification: an empty /Reference (no DocMDP: an approval signature),
+        // then a comment, which P=1 and P=2 forbid.
+        ("/Reference emptied, then a comment", |doc| {
+            let r = signature_dict(doc);
+            doc.update_dict(r, |d| d.set(b"Reference".to_vec(), Object::Array(Vec::new()))).unwrap();
+            add_comment(doc);
+        }),
+    ];
+    let mut failures = Vec::new();
+    for (what, attack) in rewrites {
+        for level in accepted_levels(&fixture(), attack) {
+            failures.push(format!("{what}: {level}"));
+        }
+    }
+    assert!(failures.is_empty(), "accepted as permitted changes:\n{}", failures.join("\n"));
+}
+
+#[test]
+fn a_signed_signature_widget_is_not_moved_or_redrawn_after_signing() {
+    // The signer saw the signature where it was drawn. A later revision that stretches the signed
+    // widget over the page and gives it a new appearance shows the reader something else.
+    let accepted = accepted_levels(&fixture(), |doc| {
+        let widget = doc
+            .object_numbers()
+            .into_iter()
+            .map(|num| pdfcraft_cos::ObjRef { num, generation: doc.generation(num) })
+            .find(|r| doc.get(*r).as_dict().is_some_and(|d| d.name(b"FT") == Some(b"Sig") && d.contains(b"V")))
+            .expect("the signed field");
+        let cover = doc.add(stream_of(b"1 1 1 rg 0 0 300 300 re f BT /F1 14 Tf 20 250 Td (Forged text) Tj ET"));
+        doc.update_dict(widget, |w| {
+            w.set(b"Rect".to_vec(), Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(300), Object::Int(300)]));
+            w.set(b"AP".to_vec(), Object::Dict(dict_of(vec![("N", Object::Ref(cover))])));
+        })
+        .unwrap();
+    });
+    assert!(accepted.is_empty(), "a moved and redrawn signed widget was accepted:\n{}", accepted.join("\n"));
+}
+
+#[test]
+fn a_copied_signature_dictionary_added_after_signing_is_not_a_valid_signature() {
+    // A second field whose value copies the signer's dictionary (the same /ByteRange and
+    // /Contents) with a reason of the forger's choosing. Its bytes check out, but the dictionary
+    // isn't part of the revision they cover: it is not a signature the signer made.
+    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
+    let trust = TrustStore { certs: vec![id.certificate.clone()] };
+    let signed = pdfcraft_sign::sign(&open(&fixture()), &id, &opts()).unwrap();
+    let forged = edit_after(&signed, |doc| {
+        let original = signature_dict(doc);
+        let mut copy = doc.get(original).as_dict().cloned().unwrap();
+        copy.set(b"Reason".to_vec(), PdfString::text("I agree to pay 1,000,000"));
+        let copy = doc.add(Object::Dict(copy));
+        let widget = doc.add(Object::Dict(dict_of(vec![
+            ("Type", Object::name("Annot")),
+            ("Subtype", Object::name("Widget")),
+            ("FT", Object::name("Sig")),
+            ("T", Object::String(PdfString::text("Forged"))),
+            ("Rect", Object::Array(vec![Object::Int(0); 4])),
+            ("P", oref(3)),
+            ("V", Object::Ref(copy)),
+        ])));
+        doc.update_dict(pdfcraft_cos::ObjRef { num: 3, generation: 0 }, |p| {
+            if let Some(Object::Array(a)) = p.get_mut(b"Annots") {
+                a.push(Object::Ref(widget));
+            }
+        })
+        .unwrap();
+        let root = doc.root().unwrap();
+        doc.update_dict(root, |c| {
+            if let Some(Object::Dict(af)) = c.get_mut(b"AcroForm")
+                && let Some(Object::Array(fields)) = af.get_mut(b"Fields")
+            {
+                fields.push(Object::Ref(widget));
+            }
+        })
+        .unwrap();
+    });
+    let doc = open(&forged);
+    let sigs = signatures(&doc, &forged, &trust);
+    let copy = sigs.iter().find(|s| s.field == "Forged").expect("the forged field is listed");
+    assert_ne!(copy.status, Status::Valid, "the copied signature validated: {:?} {:?} {:?}", copy.reason, copy.modification, copy.details);
+    // The signer's own signature stays valid: adding a signature field is a permitted change.
+    let own = sigs.iter().find(|s| s.field == "Signature1").expect("the signed field is listed");
+    assert_eq!(own.status, Status::Valid, "{:?} {:?}", own.modification, own.details);
+}
+
+#[test]
+fn the_catalog_is_not_replaced_after_signing() {
+    // A new catalog with an action that runs when the file opens, made the trailer's /Root.
+    let open_action = |doc: &mut Document| {
+        let old = doc.root().unwrap();
+        let mut catalog = doc.get(old).as_dict().cloned().unwrap();
+        catalog.set(
+            b"OpenAction".to_vec(),
+            Object::Dict(dict_of(vec![("S", Object::name("JavaScript")), ("JS", Object::String(PdfString::text("app.alert('forged')")))])),
+        );
+        let new = doc.add(Object::Dict(catalog));
+        doc.trailer_mut().set(b"Root".to_vec(), Object::Ref(new));
+    };
+    // A new catalog whose /Pages is a new page tree showing other text.
+    let other_pages = |doc: &mut Document| {
+        let old = doc.root().unwrap();
+        let content = doc.add(stream_of(b"BT /F1 14 Tf 20 250 Td (Forged text) Tj ET"));
+        let page = doc.add(Object::Dict(dict_of(vec![
+            ("Type", Object::name("Page")),
+            ("MediaBox", Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(300), Object::Int(300)])),
+            ("Contents", Object::Ref(content)),
+            ("Resources", Object::Dict(dict_of(vec![("Font", Object::Dict(dict_of(vec![("F1", oref(5))])))]))),
+        ])));
+        let pages = doc.add(Object::Dict(dict_of(vec![
+            ("Type", Object::name("Pages")),
+            ("Kids", Object::Array(vec![Object::Ref(page)])),
+            ("Count", Object::Int(1)),
+        ])));
+        doc.update_dict(page, |p| p.set(b"Parent".to_vec(), Object::Ref(pages))).unwrap();
+        let mut catalog = doc.get(old).as_dict().cloned().unwrap();
+        catalog.set(b"Pages".to_vec(), Object::Ref(pages));
+        let new = doc.add(Object::Dict(catalog));
+        doc.trailer_mut().set(b"Root".to_vec(), Object::Ref(new));
+    };
+    let mut failures = Vec::new();
+    for level in accepted_levels(&fixture(), open_action) {
+        failures.push(format!("a new catalog with an /OpenAction: {level}"));
+    }
+    for level in accepted_levels(&fixture(), other_pages) {
+        failures.push(format!("a new catalog with another page tree: {level}"));
+    }
+    assert!(failures.is_empty(), "accepted as permitted changes:\n{}", failures.join("\n"));
+}
+
+/// A one-page document whose text sits in an optional-content group (object 8) that the
+/// catalog's indirect `/OCProperties` (object 7) lists as shown.
+fn fixture_with_layer() -> Vec<u8> {
+    let content = b"/OC /oc1 BDC BT /F1 14 Tf 20 250 Td (Clause 4: the buyer pays) Tj ET EMC";
+    let objs: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R] >> /OCProperties 7 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /Properties << /oc1 8 0 R >> >> /Annots [6 0 R] >>".to_vec(),
+        [format!("<< /Length {} >>\nstream\n", content.len()).as_bytes(), content, b"\nendstream"].concat(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Approval) /Rect [150 20 280 70] /P 3 0 R /F 4 >>".to_vec(),
+        b"<< /OCGs [8 0 R] /D << /ON [8 0 R] >> >>".to_vec(),
+        b"<< /Type /OCG /Name (Clause 4) >>".to_vec(),
+    ];
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(o);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+    out
+}
+
+/// Hide the clause: rewrite `/OCProperties` (object 7) so its group starts off, adding `extra`.
+fn hide_layer(doc: &mut Document, extra: &[(&str, Object)]) {
+    let mut d = dict_of(vec![("OCGs", Object::Array(vec![oref(8)])), ("D", Object::Dict(dict_of(vec![("OFF", Object::Array(vec![oref(8)]))])))]);
+    for (k, v) in extra {
+        d.set(k.as_bytes().to_vec(), v.clone());
+    }
+    doc.set(pdfcraft_cos::ObjRef { num: 7, generation: 0 }, Object::Dict(d));
+}
+
+#[test]
+fn an_indirect_catalog_entry_given_a_form_key_after_signing_is_still_judged() {
+    // An existing object is judged by what it was when signed, not only when a signed page draws
+    // it: the catalog's indirect /OCProperties decides which layers show.
+    let base = fixture_with_layer();
+    assert_eq!(accepted_levels(&base, |doc| hide_layer(doc, &[])), Vec::<String>::new(), "hiding the layer");
+    let accepted = accepted_levels(&base, |doc| hide_layer(doc, &[("FT", Object::name("Tx"))]));
+    assert!(accepted.is_empty(), "hiding the layer with /FT was accepted:\n{}", accepted.join("\n"));
+}
