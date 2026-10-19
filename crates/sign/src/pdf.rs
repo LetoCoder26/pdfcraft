@@ -1666,14 +1666,29 @@ fn existing_change_kind(doc: &Document, old: &Document, d: &Dict, b: &Dict) -> &
         Some(b"Pages") => return kind::PAGES,
         _ => {}
     }
-    if let Some((ft, field)) = field_type(old, b)
-        && ft == b"Sig"
-    {
-        // A signature field, or a widget of one. Signing it is a signature change. Once signed it
-        // is part of what the signer saw: moving, resizing or redrawing its widget afterwards
-        // (a full-page /Rect with a new appearance) is not.
-        let signed = field.get(b"V").map(|v| old.resolve(v)).is_some_and(|v| v.as_dict().is_some());
-        return if signed { kind::OTHER } else { kind::SIGNATURE };
+    let (ft, value) = field_info(old, b);
+    if ft.as_deref() == Some(b"Sig") {
+        // A signature field, or a widget of one. Once signed it is part of what the signer saw:
+        // moving, resizing or redrawing its widget afterwards (a full-page /Rect with a new
+        // appearance) is not permitted.
+        let signature = |doc: &Document, v: Option<Object>| v.map(|v| doc.resolve(&v)).is_some_and(|v| v.as_dict().is_some());
+        if signature(old, value) {
+            return kind::OTHER;
+        }
+        // Unsigned when signed. Signing it writes its value and its appearance (a writer that
+        // re-encrypts the file may also write its strings in another form), and leaves the field
+        // where it is and what it is: that is a signature change. A change that signs nothing is a
+        // form field edit like any other, and one that also moves or restructures the field is
+        // neither.
+        const PLACE: [&[u8]; 5] = [b"Parent", b"Kids", b"P", b"Subtype", b"FT"];
+        let placed = |doc: &Document, x: &Dict| (nums(doc, x, b"Rect"), PLACE.map(|k| x.get(k).cloned()));
+        return if !signature(doc, field_info(doc, d).1) {
+            kind::FORM_FILL
+        } else if placed(doc, d) == placed(old, b) {
+            kind::SIGNATURE
+        } else {
+            kind::OTHER
+        };
     }
     match b.name(b"Subtype") {
         Some(b"Widget") => return kind::FORM_FILL,
@@ -1733,20 +1748,25 @@ fn catalog_change_kind(doc: &Document, old: &Document, d: &Dict, b: &Dict) -> &'
     }
 }
 
-/// The field type of `d` in `doc` and the field dictionary that sets it: `d` itself, or the
-/// nearest ancestor through `/Parent` (widgets and kids inherit `/FT`). The walk is bounded, so a
+/// The field type and the value of `d` in `doc`, each from `d` itself or from the nearest ancestor
+/// through `/Parent` that has it: both are inheritable (ISO 32000-2 §12.7.4.1), and a signed
+/// terminal field can hold `/V` below the ancestor that sets `/FT`. The walk is bounded, so a
 /// `/Parent` cycle ends it.
-fn field_type(doc: &Document, d: &Dict) -> Option<(Vec<u8>, Dict)> {
+fn field_info(doc: &Document, d: &Dict) -> (Option<Vec<u8>>, Option<Object>) {
     const MAX_FIELD_DEPTH: usize = 32;
+    let (mut ft, mut value) = (None, None);
     let mut d = d.clone();
     for _ in 0..MAX_FIELD_DEPTH {
-        if let Some(ft) = d.name(b"FT") {
-            return Some((ft.to_vec(), d));
+        ft = ft.or_else(|| d.name(b"FT").map(<[u8]>::to_vec));
+        value = value.or_else(|| d.get(b"V").cloned());
+        if ft.is_some() && value.is_some() {
+            break;
         }
-        let parent = doc.resolve(d.get(b"Parent")?);
-        d = parent.as_dict()?.clone();
+        let Some(parent) = d.get(b"Parent").map(|p| doc.resolve(p)) else { break };
+        let Some(parent) = parent.as_dict() else { break };
+        d = parent.clone();
     }
-    None
+    (ft, value)
 }
 
 // ── signing ─────────────────────────────────────────────────────────────────────────────────

@@ -2205,19 +2205,26 @@ fn rewritten_page_resources_are_page_content_whatever_keys_they_carry() {
 /// The DocMDP levels at which `attack` on the signed `base` is *not* refused, each with what the
 /// validator said. Empty when every level refuses it (and the untouched file is valid).
 fn accepted_levels(base: &[u8], attack: impl Fn(&mut Document)) -> Vec<String> {
-    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
-    let trust = TrustStore { certs: vec![id.certificate.clone()] };
-    let check = |bytes: &[u8]| signatures(&open(bytes), bytes, &trust).into_iter().find(|s| s.signed).unwrap();
     let mut accepted = Vec::new();
     for certify in LEVELS {
-        let signed = pdfcraft_sign::sign(&open(base), &id, &SignOptions { certify, ..opts() }).unwrap();
-        assert_eq!(check(&signed).status, Status::Valid, "{certify:?}: untouched");
-        let s = check(&edit_after(&signed, &attack));
-        if s.status != Status::Invalid || !matches!(s.modification, Modification::Disallowed(_)) {
-            accepted.push(format!("certify {certify:?}: {:?}, {:?}", s.status, s.modification));
+        let (status, modification) = verdict_after(base, certify, &attack);
+        if status != Status::Invalid || !matches!(modification, Modification::Disallowed(_)) {
+            accepted.push(format!("certify {certify:?}: {status:?}, {modification:?}"));
         }
     }
     accepted
+}
+
+/// What the validator says about a new signature "Signature1" on `base`, signed at DocMDP
+/// `certify`, once `attack` has been appended. The untouched file must be valid.
+fn verdict_after(base: &[u8], certify: Option<u8>, attack: impl Fn(&mut Document)) -> (Status, Modification) {
+    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
+    let trust = TrustStore { certs: vec![id.certificate.clone()] };
+    let check = |bytes: &[u8]| signatures(&open(bytes), bytes, &trust).into_iter().find(|s| s.field == "Signature1").expect("the signed field");
+    let signed = pdfcraft_sign::sign(&open(base), &id, &SignOptions { certify, ..opts() }).unwrap();
+    assert_eq!(check(&signed).status, Status::Valid, "{certify:?}: untouched");
+    let s = check(&edit_after(&signed, attack));
+    (s.status, s.modification)
 }
 
 /// The signature dictionary (the value of the signed field) in `doc`.
@@ -2259,6 +2266,17 @@ fn a_signature_dictionary_is_not_rewritten_after_signing() {
     assert!(failures.is_empty(), "accepted as permitted changes:\n{}", failures.join("\n"));
 }
 
+/// Stretch widget `widget` over the page and give it an appearance that covers the page with other
+/// text.
+fn stretch_widget(doc: &mut Document, widget: pdfcraft_cos::ObjRef) {
+    let cover = doc.add(stream_of(b"1 1 1 rg 0 0 300 300 re f BT /F1 14 Tf 20 250 Td (Forged text) Tj ET"));
+    doc.update_dict(widget, |w| {
+        w.set(b"Rect".to_vec(), Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(300), Object::Int(300)]));
+        w.set(b"AP".to_vec(), Object::Dict(dict_of(vec![("N", Object::Ref(cover))])));
+    })
+    .unwrap();
+}
+
 #[test]
 fn a_signed_signature_widget_is_not_moved_or_redrawn_after_signing() {
     // The signer saw the signature where it was drawn. A later revision that stretches the signed
@@ -2270,14 +2288,111 @@ fn a_signed_signature_widget_is_not_moved_or_redrawn_after_signing() {
             .map(|num| pdfcraft_cos::ObjRef { num, generation: doc.generation(num) })
             .find(|r| doc.get(*r).as_dict().is_some_and(|d| d.name(b"FT") == Some(b"Sig") && d.contains(b"V")))
             .expect("the signed field");
-        let cover = doc.add(stream_of(b"1 1 1 rg 0 0 300 300 re f BT /F1 14 Tf 20 250 Td (Forged text) Tj ET"));
-        doc.update_dict(widget, |w| {
-            w.set(b"Rect".to_vec(), Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(300), Object::Int(300)]));
-            w.set(b"AP".to_vec(), Object::Dict(dict_of(vec![("N", Object::Ref(cover))])));
-        })
-        .unwrap();
+        stretch_widget(doc, widget);
     });
     assert!(accepted.is_empty(), "a moved and redrawn signed widget was accepted:\n{}", accepted.join("\n"));
+}
+
+/// `fixture()` with its unsigned signature field in two parts: a parent field (object 6) that sets
+/// `/FT /Sig` and is named "Sigs", and a kid (object 7) named "A" that is also the widget. The kid
+/// inherits the field type, so the field is "Sigs.A".
+fn fixture_with_a_kid_signature_field() -> Vec<u8> {
+    let objs: Vec<&[u8]> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R] >> >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [7 0 R] >>",
+        b"<< /Length 44 >>\nstream\nBT /F1 14 Tf 20 250 Td (Contract text) Tj ET\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /FT /Sig /T (Sigs) /Kids [7 0 R] >>",
+        b"<< /Type /Annot /Subtype /Widget /T (A) /Parent 6 0 R /Rect [150 20 280 70] /P 3 0 R /F 4 >>",
+    ];
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(o);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+    out
+}
+
+/// The two unsigned signature fields: (what, file, its widget, its field dictionary, its name).
+fn unsigned_signature_fields() -> [(&'static str, Vec<u8>, u32, u32, &'static str); 2] {
+    [("its own /FT", fixture(), 6, 6, "Approval"), ("an inherited /FT", fixture_with_a_kid_signature_field(), 7, 7, "Sigs.A")]
+}
+
+#[test]
+fn an_unsigned_signature_widget_moved_or_redrawn_is_no_signature() {
+    // Before it is signed, a signature field's widget is a form field like any other. Moving it
+    // over the page and redrawing it signs nothing, so it is not a signature change: a
+    // certification that permits no changes is broken by it.
+    let mut failures = Vec::new();
+    for (what, base, widget, _, _) in unsigned_signature_fields() {
+        let (status, modification) = verdict_after(&base, Some(1), |doc| stretch_widget(doc, pdfcraft_cos::ObjRef { num: widget, generation: 0 }));
+        if status != Status::Invalid || !matches!(modification, Modification::Disallowed(_)) {
+            failures.push(format!("{what}: {status:?}, {modification:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "an unsigned signature widget moved under P=1 was accepted:\n{}", failures.join("\n"));
+}
+
+#[test]
+fn signing_a_field_does_not_move_its_widget() {
+    // Signing writes the field's value and its appearance. A value written together with a moved
+    // widget is not that, at any level.
+    let mut failures = Vec::new();
+    for (what, base, widget, field, _) in unsigned_signature_fields() {
+        let accepted = accepted_levels(&base, |doc| {
+            let sig = doc.add(Object::Dict(dict_of(vec![("Type", Object::name("Sig")), ("Filter", Object::name("Adobe.PPKLite"))])));
+            doc.update_dict(pdfcraft_cos::ObjRef { num: field, generation: 0 }, |f| f.set(b"V".to_vec(), Object::Ref(sig))).unwrap();
+            stretch_widget(doc, pdfcraft_cos::ObjRef { num: widget, generation: 0 });
+        });
+        failures.extend(accepted.into_iter().map(|level| format!("{what}: {level}")));
+    }
+    assert!(failures.is_empty(), "a signed value with a moved widget was accepted:\n{}", failures.join("\n"));
+}
+
+#[test]
+fn a_signed_field_that_inherits_its_type_is_not_moved_or_redrawn_after_signing() {
+    // "Sigs.A" is signed first: the kid holds the value while its parent sets /FT. A later
+    // signature covers it signed, so moving and redrawing its widget afterwards is not permitted
+    // for that later signature either. (Its own signature refuses any change to its field.)
+    let first_id = pkcs12::open(&data("ec-p256.p12"), "test").unwrap();
+    let kid_signed =
+        pdfcraft_sign::sign(&open(&fixture_with_a_kid_signature_field()), &first_id, &SignOptions { field: Some("Sigs.A".into()), ..opts() })
+            .unwrap();
+    let (status, modification) = verdict_after(&kid_signed, None, |doc| stretch_widget(doc, pdfcraft_cos::ObjRef { num: 7, generation: 0 }));
+    assert!(
+        status == Status::Invalid && matches!(modification, Modification::Disallowed(_)),
+        "a moved and redrawn signed kid widget was accepted by the later signature: {status:?}, {modification:?}"
+    );
+}
+
+#[test]
+fn signing_an_unsigned_field_later_is_a_permitted_signature_change() {
+    // The guard on the other side: a second signer signing a field left empty keeps the first
+    // signature valid at every level, whether the field sets /FT itself or inherits it.
+    let first_id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
+    let second_id = pkcs12::open(&data("ec-p256.p12"), "test").unwrap();
+    let trust = TrustStore { certs: vec![first_id.certificate.clone()] };
+    for (what, base, _, _, name) in unsigned_signature_fields() {
+        for certify in LEVELS {
+            let first = pdfcraft_sign::sign(&open(&base), &first_id, &SignOptions { certify, ..opts() }).unwrap();
+            let second = pdfcraft_sign::sign(&open(&first), &second_id, &SignOptions { field: Some(name.to_string()), ..opts() }).unwrap();
+            let sigs = signatures(&open(&second), &second, &trust);
+            let s = sigs.iter().find(|s| s.field == "Signature1").expect("the first signature");
+            assert_eq!(s.status, Status::Valid, "{what}, {certify:?}: {:?} {:?}", s.modification, s.details);
+            assert_eq!(s.modification, Modification::Allowed(vec![kind::SIGNATURE]), "{what}, {certify:?}");
+            assert!(sigs.iter().any(|s| s.field == name && s.signed), "{what}, {certify:?}: the field is signed");
+        }
+    }
 }
 
 /// Add a signature field named "Forged" on the page, with `value` as its `/V`, listed in the form.
