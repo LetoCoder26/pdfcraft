@@ -488,10 +488,11 @@ struct Field {
 }
 
 /// Where a signature's own dictionary lives: the field that holds it and, when `/V` is
-/// indirect, the dictionary's object. A signature is the signer's only when this dictionary is
-/// part of the revision its byte range covers and is unchanged since: a copy added later under
-/// another field (the same `/ByteRange` and `/Contents`, a reason of the forger's choosing) has
-/// bytes that check out but was never signed.
+/// indirect, the dictionary's object. A signature is the signer's only when both the field and
+/// its dictionary are part of the revision its byte range covers and are unchanged since. A copy
+/// added later under another field (the same `/ByteRange` and `/Contents`, a reason of the
+/// forger's choosing) has bytes that check out but was never signed, and so has a new field whose
+/// `/V` names the signer's own dictionary: its name, page and appearance were never signed.
 #[derive(Clone, Copy, Debug, Default)]
 struct Own {
     field: Option<ObjRef>,
@@ -499,15 +500,12 @@ struct Own {
 }
 
 impl Own {
-    /// Whether the signature dictionary is in `old` (the signed revision) as it is in `doc`.
+    /// Whether the signature's field, and its dictionary when indirect, are in `old` (the signed
+    /// revision) as they are in `doc`. A field that is a direct object can't be found there, so it
+    /// is never the signed one (ISO 32000-2 requires fields to be indirect).
     fn unchanged(&self, doc: &Document, old: &Document) -> bool {
         let same = |r: ObjRef| old.generation(r.num) == r.generation && old.try_get(r.num).ok().is_some_and(|o| *o == *doc.get(r));
-        match (self.value, self.field) {
-            (Some(v), _) => same(v),
-            // A direct /V: the field holding it must be the signed one, unchanged.
-            (None, Some(f)) => same(f),
-            (None, None) => false,
-        }
+        self.field.is_some_and(same) && self.value.is_none_or(same)
     }
 }
 

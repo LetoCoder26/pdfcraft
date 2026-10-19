@@ -2280,6 +2280,45 @@ fn a_signed_signature_widget_is_not_moved_or_redrawn_after_signing() {
     assert!(accepted.is_empty(), "a moved and redrawn signed widget was accepted:\n{}", accepted.join("\n"));
 }
 
+/// Add a signature field named "Forged" on the page, with `value` as its `/V`, listed in the form.
+fn add_forged_signature_field(doc: &mut Document, value: Object) {
+    let widget = doc.add(Object::Dict(dict_of(vec![
+        ("Type", Object::name("Annot")),
+        ("Subtype", Object::name("Widget")),
+        ("FT", Object::name("Sig")),
+        ("T", Object::String(PdfString::text("Forged"))),
+        ("Rect", Object::Array(vec![Object::Int(0); 4])),
+        ("P", oref(3)),
+        ("V", value),
+    ])));
+    doc.update_dict(pdfcraft_cos::ObjRef { num: 3, generation: 0 }, |p| {
+        if let Some(Object::Array(a)) = p.get_mut(b"Annots") {
+            a.push(Object::Ref(widget));
+        }
+    })
+    .unwrap();
+    let root = doc.root().unwrap();
+    doc.update_dict(root, |c| {
+        if let Some(Object::Dict(af)) = c.get_mut(b"AcroForm")
+            && let Some(Object::Array(fields)) = af.get_mut(b"Fields")
+        {
+            fields.push(Object::Ref(widget));
+        }
+    })
+    .unwrap();
+}
+
+/// The forged field in `forged` is not a valid signature, and the signer's own one still is.
+fn assert_only_the_signers_field_is_valid(forged: &[u8], trust: &TrustStore, what: &str) {
+    let doc = open(forged);
+    let sigs = signatures(&doc, forged, trust);
+    let copy = sigs.iter().find(|s| s.field == "Forged").expect("the forged field is listed");
+    assert_ne!(copy.status, Status::Valid, "{what} validated: {:?} {:?} {:?}", copy.reason, copy.modification, copy.details);
+    // The signer's own signature stays valid: adding a signature field is a permitted change.
+    let own = sigs.iter().find(|s| s.field == "Signature1").expect("the signed field is listed");
+    assert_eq!(own.status, Status::Valid, "{:?} {:?}", own.modification, own.details);
+}
+
 #[test]
 fn a_copied_signature_dictionary_added_after_signing_is_not_a_valid_signature() {
     // A second field whose value copies the signer's dictionary (the same /ByteRange and
@@ -2293,38 +2332,24 @@ fn a_copied_signature_dictionary_added_after_signing_is_not_a_valid_signature() 
         let mut copy = doc.get(original).as_dict().cloned().unwrap();
         copy.set(b"Reason".to_vec(), PdfString::text("I agree to pay 1,000,000"));
         let copy = doc.add(Object::Dict(copy));
-        let widget = doc.add(Object::Dict(dict_of(vec![
-            ("Type", Object::name("Annot")),
-            ("Subtype", Object::name("Widget")),
-            ("FT", Object::name("Sig")),
-            ("T", Object::String(PdfString::text("Forged"))),
-            ("Rect", Object::Array(vec![Object::Int(0); 4])),
-            ("P", oref(3)),
-            ("V", Object::Ref(copy)),
-        ])));
-        doc.update_dict(pdfcraft_cos::ObjRef { num: 3, generation: 0 }, |p| {
-            if let Some(Object::Array(a)) = p.get_mut(b"Annots") {
-                a.push(Object::Ref(widget));
-            }
-        })
-        .unwrap();
-        let root = doc.root().unwrap();
-        doc.update_dict(root, |c| {
-            if let Some(Object::Dict(af)) = c.get_mut(b"AcroForm")
-                && let Some(Object::Array(fields)) = af.get_mut(b"Fields")
-            {
-                fields.push(Object::Ref(widget));
-            }
-        })
-        .unwrap();
+        add_forged_signature_field(doc, Object::Ref(copy));
     });
-    let doc = open(&forged);
-    let sigs = signatures(&doc, &forged, &trust);
-    let copy = sigs.iter().find(|s| s.field == "Forged").expect("the forged field is listed");
-    assert_ne!(copy.status, Status::Valid, "the copied signature validated: {:?} {:?} {:?}", copy.reason, copy.modification, copy.details);
-    // The signer's own signature stays valid: adding a signature field is a permitted change.
-    let own = sigs.iter().find(|s| s.field == "Signature1").expect("the signed field is listed");
-    assert_eq!(own.status, Status::Valid, "{:?} {:?}", own.modification, own.details);
+    assert_only_the_signers_field_is_valid(&forged, &trust, "the copied signature");
+}
+
+#[test]
+fn a_field_reusing_the_signers_dictionary_added_after_signing_is_not_a_second_signature() {
+    // A second field whose /V is the signer's own, unchanged dictionary. The dictionary is the
+    // signed one, but the field (its name, page and appearance) was never signed: it must not
+    // show as another signature by the same signer.
+    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
+    let trust = TrustStore { certs: vec![id.certificate.clone()] };
+    let signed = pdfcraft_sign::sign(&open(&fixture()), &id, &opts()).unwrap();
+    let forged = edit_after(&signed, |doc| {
+        let original = signature_dict(doc);
+        add_forged_signature_field(doc, Object::Ref(original));
+    });
+    assert_only_the_signers_field_is_valid(&forged, &trust, "the reused signature");
 }
 
 #[test]
