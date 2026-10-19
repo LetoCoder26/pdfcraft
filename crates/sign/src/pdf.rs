@@ -1371,6 +1371,13 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, own: O
             disallowed.push(kind::SIGNATURE);
         }
     }
+    // The catalog's /Perms names the certification signature itself. Elsewhere a change to it is
+    // judged as signing; under P=1, dropping or redirecting it is a change like any other,
+    // whichever object holds the catalog now.
+    let perms = |d: &Document| d.root().and_then(|r| d.get(r).as_dict().and_then(|c| c.get(b"Perms").cloned()));
+    if p == Some(1) && perms(doc) != perms(&old) && !disallowed.contains(&kind::STRUCTURE) {
+        disallowed.push(kind::STRUCTURE);
+    }
     if disallowed.is_empty() { Modification::Allowed(allowed) } else { Modification::Disallowed(disallowed) }
 }
 

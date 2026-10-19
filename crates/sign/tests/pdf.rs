@@ -2403,6 +2403,35 @@ fn signing_an_unsigned_field_later_is_a_permitted_signature_change() {
 }
 
 #[test]
+fn the_catalogs_perms_do_not_change_under_no_changes() {
+    // /Perms names the certification signature (DocMDP). Under P=1 nothing may change, so a later
+    // revision that drops it or points it elsewhere breaks the certification, whether it edits
+    // the catalog in place or names a new catalog from the trailer.
+    let drop_perms = |doc: &mut Document| {
+        let root = doc.root().unwrap();
+        doc.update_dict(root, |c| {
+            c.remove(b"Perms");
+        })
+        .unwrap();
+    };
+    let new_catalog_without_perms = |doc: &mut Document| {
+        let old = doc.root().unwrap();
+        let mut catalog = doc.get(old).as_dict().cloned().unwrap();
+        catalog.remove(b"Perms");
+        let new = doc.add(Object::Dict(catalog));
+        doc.trailer_mut().set(b"Root".to_vec(), Object::Ref(new));
+    };
+    let mut failures = Vec::new();
+    for (how, attack) in [("in place", &drop_perms as &dyn Fn(&mut Document)), ("in a new catalog", &new_catalog_without_perms)] {
+        let (status, modification) = verdict_after(&fixture(), Some(1), attack);
+        if status != Status::Invalid || !matches!(modification, Modification::Disallowed(_)) {
+            failures.push(format!("/Perms dropped {how}: {status:?}, {modification:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "under P=1:\n{}", failures.join("\n"));
+}
+
+#[test]
 fn a_later_signature_breaks_a_no_changes_certification_but_a_timestamp_does_not() {
     // DocMDP P=1 permits no changes (ISO 32000-2 §12.8.2.2): an approval signature added later,
     // in a new field or in an empty one, is a change. Validation data is not: a document
