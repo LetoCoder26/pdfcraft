@@ -1496,8 +1496,13 @@ fn a_windows_store_identity_signs_with_its_issuers() {
 /// Documenso-style: an AcroForm signature field `Timestamp_1` whose `/V` is the document
 /// timestamp dictionary (`/Type /DocTimeStamp`, `/SubFilter /ETSI.RFC3161`).
 fn fixture_timestamped_in_a_field(tsa: &TestTsa) -> Vec<u8> {
+    timestamped_in_a_field(&fixture(), tsa)
+}
+
+/// [`fixture_timestamped_in_a_field`] on top of `base`.
+fn timestamped_in_a_field(base: &[u8], tsa: &TestTsa) -> Vec<u8> {
     let mut value_num = 0;
-    let base = edit_after(&fixture(), |doc| {
+    let base = edit_after(base, |doc| {
         let field = doc.add(Object::Null);
         // `timestamp_document` adds its dictionary next.
         value_num = field.num + 1;
@@ -2378,12 +2383,14 @@ fn a_signed_field_that_inherits_its_type_is_not_moved_or_redrawn_after_signing()
 #[test]
 fn signing_an_unsigned_field_later_is_a_permitted_signature_change() {
     // The guard on the other side: a second signer signing a field left empty keeps the first
-    // signature valid at every level, whether the field sets /FT itself or inherits it.
+    // signature valid at every level that permits signing (P=1 permits nothing, see
+    // `a_later_signature_breaks_a_no_changes_certification_but_a_timestamp_does_not`), whether
+    // the field sets /FT itself or inherits it.
     let first_id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
     let second_id = pkcs12::open(&data("ec-p256.p12"), "test").unwrap();
     let trust = TrustStore { certs: vec![first_id.certificate.clone()] };
     for (what, base, _, _, name) in unsigned_signature_fields() {
-        for certify in LEVELS {
+        for certify in [None, Some(2), Some(3)] {
             let first = pdfcraft_sign::sign(&open(&base), &first_id, &SignOptions { certify, ..opts() }).unwrap();
             let second = pdfcraft_sign::sign(&open(&first), &second_id, &SignOptions { field: Some(name.to_string()), ..opts() }).unwrap();
             let sigs = signatures(&open(&second), &second, &trust);
@@ -2393,6 +2400,45 @@ fn signing_an_unsigned_field_later_is_a_permitted_signature_change() {
             assert!(sigs.iter().any(|s| s.field == name && s.signed), "{what}, {certify:?}: the field is signed");
         }
     }
+}
+
+#[test]
+fn a_later_signature_breaks_a_no_changes_certification_but_a_timestamp_does_not() {
+    // DocMDP P=1 permits no changes (ISO 32000-2 §12.8.2.2): an approval signature added later,
+    // in a new field or in an empty one, is a change. Validation data is not: a document
+    // timestamp, standalone or held by a field, keeps the certification valid (what PAdES
+    // long-term archiving adds to certified documents).
+    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
+    let second_id = pkcs12::open(&data("ec-p256.p12"), "test").unwrap();
+    let trust = TrustStore { certs: vec![id.certificate.clone()] };
+    let tsa = TestTsa {
+        id: pkcs12::open(&data("rsa-aes.p12"), "test").unwrap(),
+        time: Time { year: 2026, month: 10, day: 6, hour: 12, minute: 0, second: 0 },
+    };
+    let certification =
+        |bytes: &[u8]| signatures(&open(bytes), bytes, &trust).into_iter().find(|s| s.field == "Signature1").expect("the certification");
+    let mut failures = Vec::new();
+    for (what, base, _, _, name) in unsigned_signature_fields() {
+        let certified = pdfcraft_sign::sign(&open(&base), &id, &SignOptions { certify: Some(1), ..opts() }).unwrap();
+        let in_a_new_field = pdfcraft_sign::sign(&open(&certified), &second_id, &opts()).unwrap();
+        let in_the_empty_field =
+            pdfcraft_sign::sign(&open(&certified), &second_id, &SignOptions { field: Some(name.to_string()), ..opts() }).unwrap();
+        for (how, bytes) in [("signed in a new field", in_a_new_field), ("signed in the empty field", in_the_empty_field)] {
+            let s = certification(&bytes);
+            if s.status != Status::Invalid || !matches!(&s.modification, Modification::Disallowed(k) if k.contains(&kind::SIGNATURE)) {
+                failures.push(format!("{what}, {how}: {:?}, {:?}", s.status, s.modification));
+            }
+        }
+        let stamped = pdfcraft_sign::timestamp_document(&open(&certified), &tsa, "D:20261006120000Z").unwrap();
+        let stamped_in_a_field = timestamped_in_a_field(&certified, &tsa);
+        for (how, bytes) in [("timestamped", stamped), ("timestamped in a field", stamped_in_a_field)] {
+            let s = certification(&bytes);
+            if s.status != Status::Valid {
+                failures.push(format!("{what}, {how}: {:?}, {:?}", s.status, s.modification));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "under P=1:\n{}", failures.join("\n"));
 }
 
 /// Add a signature field named "Forged" on the page, with `value` as its `/V`, listed in the form.
