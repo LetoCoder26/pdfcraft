@@ -543,19 +543,68 @@ fn extensions_kept(doc: &Document, old: &Document, d: &Dict, b: &Dict) -> bool {
     }
 }
 
+/// The field type and the value of `d` in `doc`, each from `d` itself or from the nearest ancestor
+/// through `/Parent` that has it: both are inheritable (ISO 32000-2 §12.7.4.1), and a signed
+/// terminal field can hold `/V` below the ancestor that sets `/FT`. The walk is bounded, so a
+/// `/Parent` cycle ends it.
+fn field_info(doc: &Document, d: &Dict) -> (Option<Vec<u8>>, Option<Object>) {
+    const MAX_FIELD_DEPTH: usize = 32;
+    let (mut ft, mut value) = (None, None);
+    let mut d = d.clone();
+    for _ in 0..MAX_FIELD_DEPTH {
+        ft = ft.or_else(|| d.name(b"FT").map(<[u8]>::to_vec));
+        value = value.or_else(|| d.get(b"V").cloned());
+        if ft.is_some() && value.is_some() {
+            break;
+        }
+        let Some(parent) = d.get(b"Parent").map(|p| doc.resolve(p)) else { break };
+        let Some(parent) = parent.as_dict() else { break };
+        d = parent.clone();
+    }
+    (ft, value)
+}
+
+/// A changed signature field, or a widget of one, judged by what it was when signed (`b`; its
+/// type and value may be inherited). A signed one is what the signature shows: moving it or
+/// swapping its appearance can hide the signed page under it. An unsigned one changes as a
+/// signature only when the change signs it and leaves it where and what it is (a writer that
+/// re-encrypts the file may write its strings anew); any other edit is a form field edit like any
+/// other, and one that also moves or restructures the field is neither. `None` when `b` is no
+/// signature field.
+fn signature_field_change(doc: &Document, old: &Document, d: &Dict, b: &Dict) -> Option<&'static str> {
+    let (ft, value) = field_info(old, b);
+    if ft.as_deref() != Some(b"Sig") {
+        return None;
+    }
+    let signature = |doc: &Document, v: Option<Object>| v.map(|v| doc.resolve(&v)).is_some_and(|v| v.as_dict().is_some());
+    if signature(old, value) {
+        return Some(kind::PAGE_CONTENT);
+    }
+    const PLACE: [&[u8]; 5] = [b"Parent", b"Kids", b"P", b"Subtype", b"FT"];
+    let rect = |doc: &Document, x: &Dict| {
+        x.get(b"Rect")
+            .map(|r| doc.resolve(r))
+            .and_then(|r| r.as_array().map(|a| a.iter().filter_map(|n| doc.resolve(n).as_f64()).collect::<Vec<_>>()))
+    };
+    let placed = |doc: &Document, x: &Dict| (rect(doc, x), PLACE.map(|k| x.get(k).cloned()));
+    Some(if !signature(doc, field_info(doc, d).1) {
+        kind::FORM_FILL
+    } else if placed(doc, d) == placed(old, b) {
+        kind::SIGNATURE
+    } else {
+        kind::OTHER
+    })
+}
+
 fn change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>) -> &'static str {
     let ty = d.name(b"Type");
     // A later revision cannot make an existing object a signature by relabelling it: a signature
     // change is only a brand-new object, or one that was already a signature object when signed.
     let signature_ok = before.is_none_or(is_signature_dict);
-    // A signature widget that already held a signature is what the signature shows: moving it or
-    // swapping its appearance can hide the signed page under it. Judged by the signed revision,
-    // so relabelling the widget now does not change that.
-    if before.is_some_and(|b| {
-        b.name(b"Subtype") == Some(b"Widget") && b.name(b"FT") == Some(b"Sig") && b.get(b"V").is_some_and(|v| old.resolve(v).as_dict().is_some())
-    }) && before != Some(d)
-    {
-        return kind::PAGE_CONTENT;
+    // A signature field or widget is judged by the role it held in the signed revision, so
+    // relabelling it now does not change that.
+    if let Some(what) = before.and_then(|b| signature_field_change(doc, old, d, b)) {
+        return what;
     }
     match ty {
         // Only a new signature value or policy: rewriting a signed one is not a signature (#1788).
