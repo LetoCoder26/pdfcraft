@@ -136,7 +136,36 @@ pub(super) fn classify_changes(doc: &Document, old: Option<Document>, p: Option<
             disallowed.push(what);
         }
     }
+    // DocMDP P=1 permits no changes at all (ISO 32000-2 §12.8.2.2), and signing the document
+    // again is one. Validation data is not: a document timestamp (§12.8.5) and the security store
+    // (§12.8.4.3) may follow, as PAdES long-term archiving adds them to certified documents. So
+    // signature changes break a P=1 certification unless every signature added since is a
+    // document timestamp.
+    if p == Some(1) {
+        if allowed.contains(&kind::SIGNATURE) && later_approval_signature(doc, &old) {
+            allowed.retain(|k| *k != kind::SIGNATURE);
+            if !disallowed.contains(&kind::SIGNATURE) {
+                disallowed.push(kind::SIGNATURE);
+            }
+        }
+        // The catalog's /Perms names the certification signature itself. Elsewhere a change to it
+        // is judged as signing; under P=1 dropping or redirecting it is a change like any other.
+        let perms = |d: &Document| d.root().and_then(|r| d.get(r).as_dict().and_then(|c| c.get(b"Perms").cloned()));
+        if perms(doc) != perms(&old) && !disallowed.contains(&kind::STRUCTURE) {
+            disallowed.push(kind::STRUCTURE);
+        }
+    }
     if disallowed.is_empty() { Modification::Allowed(allowed) } else { Modification::Disallowed(disallowed) }
+}
+
+/// Whether a signature field of `doc` holds a value that `old` (a signed revision) didn't give it,
+/// other than a document timestamp: an approval or certification signature made since.
+fn later_approval_signature(doc: &Document, old: &Document) -> bool {
+    super::listing::sig_fields(doc).iter().any(|f| {
+        let Some(v) = f.signature(doc) else { return false };
+        let before = f.r.and_then(|r| old.try_get(r.num).ok()).and_then(|o| o.as_dict().and_then(|d| d.get(b"V")).map(|v| old.resolve(v)));
+        !super::validate::is_doc_timestamp(&v) && before.as_deref().and_then(Object::as_dict) != Some(&v)
+    })
 }
 
 struct ChangedObjectClassifier<'a> {
