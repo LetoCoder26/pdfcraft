@@ -394,21 +394,7 @@ fn fixture_with_a_kid_signature_field() -> Vec<u8> {
         b"<< /FT /Sig /T (Sigs) /Kids [7 0 R] >>",
         b"<< /Type /Annot /Subtype /Widget /T (A) /Parent 6 0 R /Rect [150 20 280 70] /P 3 0 R /F 4 >>",
     ];
-    let mut out = b"%PDF-1.7\n".to_vec();
-    let mut offsets = Vec::new();
-    for (i, o) in objs.iter().enumerate() {
-        offsets.push(out.len());
-        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
-        out.extend_from_slice(o);
-        out.extend_from_slice(b"\nendobj\n");
-    }
-    let xref = out.len();
-    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
-    for o in offsets {
-        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
-    }
-    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
-    out
+    write_pdf(&objs)
 }
 
 /// The two unsigned signature fields: (what, file, its widget and field dictionary, its name).
@@ -516,20 +502,7 @@ fn a_signed_field_deep_below_its_type_is_not_moved_or_redrawn_after_signing() {
     objs.push(
         format!("<< /Type /Annot /Subtype /Widget /T (L{DEPTH}) /Parent {} 0 R /Rect [150 20 280 70] /P 3 0 R /F 4 >>", widget - 1).into_bytes(),
     );
-    let mut base = b"%PDF-1.7\n".to_vec();
-    let mut offsets = Vec::new();
-    for (i, o) in objs.iter().enumerate() {
-        offsets.push(base.len());
-        base.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
-        base.extend_from_slice(o);
-        base.extend_from_slice(b"\nendobj\n");
-    }
-    let xref = base.len();
-    base.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
-    for o in offsets {
-        base.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
-    }
-    base.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+    let base = write_pdf(&objs.iter().map(Vec::as_slice).collect::<Vec<_>>());
     let name = (0..=DEPTH).map(|level| format!("L{level}")).collect::<Vec<_>>().join(".");
     let first_id = pkcs12::open(&data("ec-p256.p12"), "test").unwrap();
     let deep_signed = pdfcraft_sign::sign(&open(&base), &first_id, &SignOptions { field: Some(name), ..opts() }).unwrap();
@@ -538,6 +511,28 @@ fn a_signed_field_deep_below_its_type_is_not_moved_or_redrawn_after_signing() {
         status == Status::Invalid && matches!(modification, Modification::Disallowed(_)),
         "a moved and redrawn deep signed widget was accepted by the later signature: {status:?}, {modification:?}"
     );
+}
+
+#[test]
+fn a_signature_field_whose_parents_loop_is_not_moved_or_redrawn_as_a_form_fill() {
+    // "Sigs.A" with the parent's /Parent pointing back at its kid: the field tree loops, so the
+    // walk up it never ends and where the field sits in the form isn't defined. The widget of a
+    // well-formed unsigned field may be moved and redrawn as a form fill; this one may not change
+    // at any level that permits filling forms.
+    let looping = edit_after(&fixture_with_a_kid_signature_field(), |doc| {
+        doc.update_dict(pdfcraft_cos::ObjRef { num: 6, generation: 0 }, |f| {
+            f.set(b"Parent".to_vec(), Object::Ref(pdfcraft_cos::ObjRef { num: 7, generation: 0 }))
+        })
+        .unwrap()
+    });
+    let mut failures = Vec::new();
+    for certify in [None, Some(2), Some(3)] {
+        let (status, modification) = verdict_after(&looping, certify, |doc| stretch_widget(doc, 7));
+        if status != Status::Invalid || !matches!(modification, Modification::Disallowed(_)) {
+            failures.push(format!("{certify:?}: {status:?}, {modification:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "the widget of a looping signature field was moved and redrawn as a form fill:\n{}", failures.join("\n"));
 }
 
 #[test]
