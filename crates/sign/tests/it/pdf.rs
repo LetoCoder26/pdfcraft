@@ -492,6 +492,55 @@ fn signing_an_unsigned_field_later_is_a_permitted_signature_change() {
 }
 
 #[test]
+fn a_signed_field_deep_below_its_type_is_not_moved_or_redrawn_after_signing() {
+    // A signature field forty levels below the ancestor that sets /FT /Sig: object 6 is "L0",
+    // objects 7–45 are "L1"…"L39", and object 46, "L40", is the terminal field and its widget.
+    // Signed first; a later signature covers it signed, so its widget can't be moved and redrawn
+    // under that signature's form-fill permission however deep the inheritance runs.
+    const DEPTH: u32 = 40;
+    let widget = 6 + DEPTH;
+    let mut objs: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R] >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [{widget} 0 R] >>"
+        )
+        .into_bytes(),
+        b"<< /Length 44 >>\nstream\nBT /F1 14 Tf 20 250 Td (Contract text) Tj ET\nendstream".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        b"<< /FT /Sig /T (L0) /Kids [7 0 R] >>".to_vec(),
+    ];
+    for level in 1..DEPTH {
+        objs.push(format!("<< /T (L{level}) /Parent {} 0 R /Kids [{} 0 R] >>", 5 + level, 7 + level).into_bytes());
+    }
+    objs.push(
+        format!("<< /Type /Annot /Subtype /Widget /T (L{DEPTH}) /Parent {} 0 R /Rect [150 20 280 70] /P 3 0 R /F 4 >>", widget - 1).into_bytes(),
+    );
+    let mut base = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(base.len());
+        base.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        base.extend_from_slice(o);
+        base.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = base.len();
+    base.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offsets {
+        base.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    base.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+    let name = (0..=DEPTH).map(|level| format!("L{level}")).collect::<Vec<_>>().join(".");
+    let first_id = pkcs12::open(&data("ec-p256.p12"), "test").unwrap();
+    let deep_signed = pdfcraft_sign::sign(&open(&base), &first_id, &SignOptions { field: Some(name), ..opts() }).unwrap();
+    let (status, modification) = verdict_after(&deep_signed, None, |doc| stretch_widget(doc, widget));
+    assert!(
+        status == Status::Invalid && matches!(modification, Modification::Disallowed(_)),
+        "a moved and redrawn deep signed widget was accepted by the later signature: {status:?}, {modification:?}"
+    );
+}
+
+#[test]
 fn invisible_signatures_and_refusals() {
     let id = pkcs12::open(&data("ec-p256.p12"), "test").unwrap();
     let signed = pdfcraft_sign::sign(&open(&fixture()), &id, &SignOptions { rect: None, ..opts() }).unwrap();

@@ -543,25 +543,42 @@ fn extensions_kept(doc: &Document, old: &Document, d: &Dict, b: &Dict) -> bool {
     }
 }
 
+/// What [`field_info`] finds for a field: its type and value (each its own or inherited), and
+/// whether the walk up `/Parent` finished. It doesn't when the chain loops or runs past
+/// `MAX_FIELD_CHAIN` ancestors: then what the field inherits is unknown.
+struct FieldInfo {
+    ft: Option<Vec<u8>>,
+    value: Option<Object>,
+    resolved: bool,
+}
+
 /// The field type and the value of `d` in `doc`, each from `d` itself or from the nearest ancestor
 /// through `/Parent` that has it: both are inheritable (ISO 32000-2 §12.7.4.1), and a signed
-/// terminal field can hold `/V` below the ancestor that sets `/FT`. The walk is bounded, so a
-/// `/Parent` cycle ends it.
-fn field_info(doc: &Document, d: &Dict) -> (Option<Vec<u8>>, Option<Object>) {
-    const MAX_FIELD_DEPTH: usize = 32;
+/// terminal field can hold `/V` below the ancestor that sets `/FT`. The walk visits each indirect
+/// ancestor once, so a `/Parent` cycle ends it, and gives up past `MAX_FIELD_CHAIN` ancestors.
+fn field_info(doc: &Document, d: &Dict) -> FieldInfo {
+    const MAX_FIELD_CHAIN: usize = 4096;
     let (mut ft, mut value) = (None, None);
+    let mut seen = HashSet::new();
     let mut d = d.clone();
-    for _ in 0..MAX_FIELD_DEPTH {
+    for _ in 0..MAX_FIELD_CHAIN {
         ft = ft.or_else(|| d.name(b"FT").map(<[u8]>::to_vec));
         value = value.or_else(|| d.get(b"V").cloned());
         if ft.is_some() && value.is_some() {
-            break;
+            return FieldInfo { ft, value, resolved: true };
         }
-        let Some(parent) = d.get(b"Parent").map(|p| doc.resolve(p)) else { break };
-        let Some(parent) = parent.as_dict() else { break };
+        // No parent, or one that isn't a dictionary: the chain ends here.
+        let Some(parent) = d.get(b"Parent") else { return FieldInfo { ft, value, resolved: true } };
+        if let Some(r) = parent.as_ref()
+            && !seen.insert(r)
+        {
+            return FieldInfo { ft, value, resolved: false };
+        }
+        let parent = doc.resolve(parent);
+        let Some(parent) = parent.as_dict() else { return FieldInfo { ft, value, resolved: true } };
         d = parent.clone();
     }
-    (ft, value)
+    FieldInfo { ft, value, resolved: false }
 }
 
 /// A changed signature field, or a widget of one, judged by what it was when signed (`b`; its
@@ -572,7 +589,12 @@ fn field_info(doc: &Document, d: &Dict) -> (Option<Vec<u8>>, Option<Object>) {
 /// other, and one that also moves or restructures the field is neither. `None` when `b` is no
 /// signature field.
 fn signature_field_change(doc: &Document, old: &Document, d: &Dict, b: &Dict) -> Option<&'static str> {
-    let (ft, value) = field_info(old, b);
+    let FieldInfo { ft, value, resolved } = field_info(old, b);
+    if !resolved {
+        // A field whose inheritance can't be followed may be a signature field: nothing may
+        // change it.
+        return Some(kind::OTHER);
+    }
     if ft.as_deref() != Some(b"Sig") {
         return None;
     }
@@ -587,7 +609,7 @@ fn signature_field_change(doc: &Document, old: &Document, d: &Dict, b: &Dict) ->
             .and_then(|r| r.as_array().map(|a| a.iter().filter_map(|n| doc.resolve(n).as_f64()).collect::<Vec<_>>()))
     };
     let placed = |doc: &Document, x: &Dict| (rect(doc, x), PLACE.map(|k| x.get(k).cloned()));
-    Some(if !signature(doc, field_info(doc, d).1) {
+    Some(if !signature(doc, field_info(doc, d).value) {
         kind::FORM_FILL
     } else if placed(doc, d) == placed(old, b) {
         kind::SIGNATURE
