@@ -586,8 +586,8 @@ fn field_info(doc: &Document, d: &Dict) -> FieldInfo {
 /// swapping its appearance can hide the signed page under it. An unsigned one changes as a
 /// signature only when the change signs it and leaves it where and what it is (a writer that
 /// re-encrypts the file may write its strings anew); any other edit is a form field edit like any
-/// other, and one that also moves or restructures the field is neither. `None` when `b` is no
-/// signature field.
+/// other unless it turns the widget into another kind of annotation, and a signing one that also
+/// moves or restructures the field is neither. `None` when `b` is no signature field.
 fn signature_field_change(doc: &Document, old: &Document, d: &Dict, b: &Dict) -> Option<&'static str> {
     let FieldInfo { ft, value, resolved } = field_info(old, b);
     if !resolved {
@@ -602,6 +602,10 @@ fn signature_field_change(doc: &Document, old: &Document, d: &Dict, b: &Dict) ->
     if signature(old, value) {
         return Some(kind::PAGE_CONTENT);
     }
+    if !signature(doc, field_info(doc, d).value) {
+        // A white /Square over the signed text, say, is no fill of the field it replaced.
+        return Some(if d.name(b"Subtype") == b.name(b"Subtype") { kind::FORM_FILL } else { kind::OTHER });
+    }
     const PLACE: [&[u8]; 5] = [b"Parent", b"Kids", b"P", b"Subtype", b"FT"];
     let rect = |doc: &Document, x: &Dict| {
         x.get(b"Rect")
@@ -609,13 +613,7 @@ fn signature_field_change(doc: &Document, old: &Document, d: &Dict, b: &Dict) ->
             .and_then(|r| r.as_array().map(|a| a.iter().filter_map(|n| doc.resolve(n).as_f64()).collect::<Vec<_>>()))
     };
     let placed = |doc: &Document, x: &Dict| (rect(doc, x), PLACE.map(|k| x.get(k).cloned()));
-    Some(if !signature(doc, field_info(doc, d).value) {
-        kind::FORM_FILL
-    } else if placed(doc, d) == placed(old, b) {
-        kind::SIGNATURE
-    } else {
-        kind::OTHER
-    })
+    Some(if placed(doc, d) == placed(old, b) { kind::SIGNATURE } else { kind::OTHER })
 }
 
 fn change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>) -> &'static str {

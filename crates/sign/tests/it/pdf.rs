@@ -516,7 +516,7 @@ fn a_signed_field_deep_below_its_type_is_not_moved_or_redrawn_after_signing() {
 #[test]
 fn a_signature_field_whose_parents_loop_is_not_moved_or_redrawn_as_a_form_fill() {
     // "Sigs.A" with the parent's /Parent pointing back at its kid: the field tree loops, so the
-    // walk up it never ends and where the field sits in the form isn't defined. The widget of a
+    // walk up it reaches no root and where the field sits in the form isn't defined. The widget of a
     // well-formed unsigned field may be moved and redrawn as a form fill; this one may not change
     // at any level that permits filling forms.
     let looping = edit_after(&fixture_with_a_kid_signature_field(), |doc| {
@@ -533,6 +533,36 @@ fn a_signature_field_whose_parents_loop_is_not_moved_or_redrawn_as_a_form_fill()
         }
     }
     assert!(failures.is_empty(), "the widget of a looping signature field was moved and redrawn as a form fill:\n{}", failures.join("\n"));
+}
+
+#[test]
+fn an_unsigned_signature_widget_turned_into_a_comment_is_no_form_fill() {
+    // Filling a form may edit an unsigned signature field's widget, not turn it into an annotation
+    // of another kind: here a white /Square over the signed text, whether the field sets /FT itself
+    // or inherits it.
+    let mut failures = Vec::new();
+    for (what, base, widget, _) in unsigned_signature_fields() {
+        for certify in LEVELS {
+            let (status, modification) = verdict_after(&base, certify, |doc| {
+                let white = Object::Array(vec![Object::Int(1); 3]);
+                doc.set(
+                    pdfcraft_cos::ObjRef { num: widget, generation: 0 },
+                    Object::Dict(dict_of(vec![
+                        ("Type", Object::name("Annot")),
+                        ("Subtype", Object::name("Square")),
+                        ("Rect", Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(300), Object::Int(300)])),
+                        ("C", white.clone()),
+                        ("IC", white),
+                        ("P", oref(3)),
+                    ])),
+                );
+            });
+            if status != Status::Invalid || !matches!(modification, Modification::Disallowed(_)) {
+                failures.push(format!("{what}, {certify:?}: {status:?}, {modification:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "an unsigned signature widget turned into a comment was accepted:\n{}", failures.join("\n"));
 }
 
 #[test]
