@@ -562,8 +562,10 @@ fn field_info(doc: &Document, d: &Dict) -> FieldInfo {
     let mut seen = HashSet::new();
     let mut d = d.clone();
     for _ in 0..MAX_FIELD_CHAIN {
-        ft = ft.or_else(|| d.name(b"FT").map(<[u8]>::to_vec));
-        value = value.or_else(|| d.get(b"V").cloned());
+        // Each read through references: a field's own entry overrides what it would inherit, and a
+        // null one is no entry (ISO 32000-2 §7.3.7).
+        ft = ft.or_else(|| d.get(b"FT").and_then(|t| doc.resolve(t).as_name().map(<[u8]>::to_vec)));
+        value = value.or_else(|| d.get(b"V").filter(|v| !matches!(*doc.resolve(v), Object::Null)).cloned());
         if ft.is_some() && value.is_some() {
             return FieldInfo { ft, value, resolved: true };
         }
@@ -604,7 +606,8 @@ fn signature_field_change(doc: &Document, old: &Document, d: &Dict, b: &Dict) ->
     }
     if !signature(doc, field_info(doc, d).value) {
         // A white /Square over the signed text, say, is no fill of the field it replaced.
-        return Some(if d.name(b"Subtype") == b.name(b"Subtype") { kind::FORM_FILL } else { kind::OTHER });
+        let subtype = |doc: &Document, x: &Dict| x.get(b"Subtype").and_then(|s| doc.resolve(s).as_name().map(<[u8]>::to_vec));
+        return Some(if subtype(doc, d) == subtype(old, b) { kind::FORM_FILL } else { kind::OTHER });
     }
     const PLACE: [&[u8]; 5] = [b"Parent", b"Kids", b"P", b"Subtype", b"FT"];
     let rect = |doc: &Document, x: &Dict| {

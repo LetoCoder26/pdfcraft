@@ -535,34 +535,92 @@ fn a_signature_field_whose_parents_loop_is_not_moved_or_redrawn_as_a_form_fill()
     assert!(failures.is_empty(), "the widget of a looping signature field was moved and redrawn as a form fill:\n{}", failures.join("\n"));
 }
 
+/// Rewrite object `widget` as a white annotation of kind `subtype` that covers the page.
+fn white_square(doc: &mut Document, widget: u32, subtype: Object) {
+    let white = Object::Array(vec![Object::Int(1); 3]);
+    doc.set(
+        pdfcraft_cos::ObjRef { num: widget, generation: 0 },
+        Object::Dict(dict_of(vec![
+            ("Type", Object::name("Annot")),
+            ("Subtype", subtype),
+            ("Rect", Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(300), Object::Int(300)])),
+            ("C", white.clone()),
+            ("IC", white),
+            ("P", oref(3)),
+        ])),
+    );
+}
+
 #[test]
 fn an_unsigned_signature_widget_turned_into_a_comment_is_no_form_fill() {
     // Filling a form may edit an unsigned signature field's widget, not turn it into an annotation
     // of another kind: here a white /Square over the signed text, whether the field sets /FT itself
-    // or inherits it.
+    // or inherits it, and whether the widget names its kind directly or through a reference.
+    let mut cases: Vec<(&str, Vec<u8>, u32, Object)> =
+        unsigned_signature_fields().into_iter().map(|(what, base, widget, _)| (what, base, widget, Object::name("Square"))).collect();
+    // The signed widget's kind is object 7, /Widget; the edit points it at object 8, /Square, which
+    // is already in the file. The two differ only once read through the references.
+    let referenced = edit_after(&fixture(), |doc| {
+        let widget = doc.add(Object::name("Widget"));
+        doc.add(Object::name("Square"));
+        doc.update_dict(pdfcraft_cos::ObjRef { num: 6, generation: 0 }, |w| w.set(b"Subtype".to_vec(), Object::Ref(widget))).unwrap();
+    });
+    assert_eq!(*open(&referenced).get(pdfcraft_cos::ObjRef { num: 8, generation: 0 }), Object::name("Square"));
+    cases.push(("a referenced /Subtype", referenced, 6, oref(8)));
     let mut failures = Vec::new();
-    for (what, base, widget, _) in unsigned_signature_fields() {
+    for (what, base, widget, subtype) in cases {
         for certify in LEVELS {
-            let (status, modification) = verdict_after(&base, certify, |doc| {
-                let white = Object::Array(vec![Object::Int(1); 3]);
-                doc.set(
-                    pdfcraft_cos::ObjRef { num: widget, generation: 0 },
-                    Object::Dict(dict_of(vec![
-                        ("Type", Object::name("Annot")),
-                        ("Subtype", Object::name("Square")),
-                        ("Rect", Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(300), Object::Int(300)])),
-                        ("C", white.clone()),
-                        ("IC", white),
-                        ("P", oref(3)),
-                    ])),
-                );
-            });
+            let (status, modification) = verdict_after(&base, certify, |doc| white_square(doc, widget, subtype.clone()));
             if status != Status::Invalid || !matches!(modification, Modification::Disallowed(_)) {
                 failures.push(format!("{what}, {certify:?}: {status:?}, {modification:?}"));
             }
         }
     }
     assert!(failures.is_empty(), "an unsigned signature widget turned into a comment was accepted:\n{}", failures.join("\n"));
+}
+
+#[test]
+fn a_kids_own_field_type_overrides_its_parents_even_through_a_reference() {
+    // "Sigs.A" with the kid's own /FT a reference to /Tx: the parent's /FT /Sig doesn't reach it,
+    // so it is a text field. Giving it a signature value and the page's content stream as its
+    // appearance signs nothing: it is a form fill, which a certification that permits no changes
+    // refuses.
+    let text_kid = edit_after(&fixture_with_a_kid_signature_field(), |doc| {
+        let tx = doc.add(Object::name("Tx"));
+        doc.update_dict(pdfcraft_cos::ObjRef { num: 7, generation: 0 }, |w| w.set(b"FT".to_vec(), Object::Ref(tx))).unwrap();
+    });
+    let (status, modification) = verdict_after(&text_kid, Some(1), |doc| {
+        let sig = doc.add(Object::Dict(dict_of(vec![("Type", Object::name("Sig")), ("Filter", Object::name("Adobe.PPKLite"))])));
+        doc.update_dict(pdfcraft_cos::ObjRef { num: 7, generation: 0 }, |w| {
+            w.set(b"V".to_vec(), Object::Ref(sig));
+            w.set(b"AP".to_vec(), Object::Dict(dict_of(vec![("N", oref(4))])));
+        })
+        .unwrap();
+    });
+    assert!(
+        status == Status::Invalid && matches!(modification, Modification::Disallowed(_)),
+        "a text field given a signature value passed as a signature under P=1: {status:?}, {modification:?}"
+    );
+}
+
+#[test]
+fn a_null_value_on_a_kid_does_not_hide_its_parents_signature() {
+    // "Sigs.A" with the signature value on the parent and /V null on the kid. A null entry is no
+    // entry, so the kid inherits the parent's value: the field is signed, and its widget can't be
+    // moved and redrawn as a form fill.
+    let parent_signed = edit_after(&fixture_with_a_kid_signature_field(), |doc| {
+        let sig = doc.add(Object::Dict(dict_of(vec![("Type", Object::name("Sig")), ("Filter", Object::name("Adobe.PPKLite"))])));
+        doc.update_dict(pdfcraft_cos::ObjRef { num: 6, generation: 0 }, |f| f.set(b"V".to_vec(), Object::Ref(sig))).unwrap();
+        doc.update_dict(pdfcraft_cos::ObjRef { num: 7, generation: 0 }, |w| w.set(b"V".to_vec(), Object::Null)).unwrap();
+    });
+    let mut failures = Vec::new();
+    for certify in [None, Some(2), Some(3)] {
+        let (status, modification) = verdict_after(&parent_signed, certify, |doc| stretch_widget(doc, 7));
+        if status != Status::Invalid || !matches!(modification, Modification::Disallowed(_)) {
+            failures.push(format!("{certify:?}: {status:?}, {modification:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "a widget below a signed parent was moved and redrawn as a form fill:\n{}", failures.join("\n"));
 }
 
 #[test]
